@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bay Area Market Data</title>
+  <meta name="description" content="Monthly housing market charts for Bay Area cities: median sale price, price per square foot, days on market, and price drops.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="page-header">
+    <h1>Bay Area Housing Market</h1>
+    <p class="subtitle">Monthly, all residential property types. Updates automatically each month.</p>
+  </header>
+
+  <section class="filters" aria-label="Filters">
+    <div class="filter-group" role="group" aria-label="Time range">
+      <span class="filter-label">Range</span>
+      <div class="segmented" id="range"></div>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="smooth" checked>
+      <span>Smooth (3-month avg)</span>
+    </label>
+    <div class="filter-group city-group" role="group" aria-label="Cities">
+      <span class="filter-label">Cities <span class="hint" id="city-hint"></span></span>
+      <div class="chips" id="cities"></div>
+    </div>
+  </section>
+
+  <main>
+    <div class="grid" id="charts"></div>
+
+    <section class="card table-card">
+      <h2>Latest month</h2>
+      <p class="card-note" id="table-note"></p>
+      <div class="table-wrap">
+        <table id="latest">
+          <thead>
+            <tr>
+              <th scope="col">City</th>
+              <th scope="col">Median price</th>
+              <th scope="col">YoY</th>
+              <th scope="col">$/sq ft</th>
+              <th scope="col">Days on market</th>
+              <th scope="col">Listings w/ price drop</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <p>Data: <a href="https://www.redfin.com/news/data-center/" rel="noopener">Redfin Data Center</a>, a national real estate brokerage. <span id="updated"></span></p>
+    <p class="fine">"Price drops" = share of active listings that had a price cut during the month. Redfin doesn't publish the number of days until a price cut, so compare it with days on market for that view.</p>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
