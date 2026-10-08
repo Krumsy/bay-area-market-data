@@ -22,6 +22,9 @@ const BAY_AREA_METRO = /^(San Francisco|Oakland|San Jose|San Rafael|Santa Rosa|V
 // Cities whose name also matches a different place inside the Bay Area.
 const METRO_OVERRIDE = { "Mountain View": /^San Jose, CA/ }; // vs. the Contra Costa CDP
 
+// Bump when the fields written below change, so the file is rebuilt even if Redfin has nothing new.
+const SCHEMA = 2;
+
 const OUT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "market.json");
 
 const num = (v) => (v === "" || v === undefined || v === "NA" ? null : Number(v));
@@ -52,6 +55,7 @@ async function main() {
       col = Object.fromEntries(f.map((name, i) => [name, i]));
       const required = ["REGION", "STATE_CODE", "PROPERTY_TYPE", "IS_SEASONALLY_ADJUSTED", "PERIOD_END",
         "MEDIAN_SALE_PRICE", "MEDIAN_PPSF", "MEDIAN_DOM", "PRICE_DROPS", "HOMES_SOLD", "INVENTORY",
+        "AVG_SALE_TO_LIST", "SOLD_ABOVE_LIST",
         "PARENT_METRO_REGION"];
       const missing = required.filter((k) => !(k in col));
       if (missing.length) throw new Error(`Redfin schema changed; missing columns: ${missing.join(", ")}`);
@@ -73,6 +77,8 @@ async function main() {
       ppsf: num(f[col.MEDIAN_PPSF]) && Math.round(num(f[col.MEDIAN_PPSF])),
       dom: num(f[col.MEDIAN_DOM]),
       priceDrops: num(f[col.PRICE_DROPS]),
+      saleToList: num(f[col.AVG_SALE_TO_LIST]),
+      soldAboveList: num(f[col.SOLD_ABOVE_LIST]),
       sold: num(f[col.HOMES_SOLD]),
       inventory: num(f[col.INVENTORY]),
     });
@@ -92,13 +98,14 @@ async function main() {
   // Redfin republishes monthly; skip the write when nothing is new so the workflow makes no commit.
   try {
     const prev = JSON.parse(fs.readFileSync(OUT, "utf8"));
-    if (prev.sourceUpdated && prev.sourceUpdated === lastUpdated) {
+    if (prev.schema === SCHEMA && prev.sourceUpdated && prev.sourceUpdated === lastUpdated) {
       console.log(`No new Redfin data (still ${lastUpdated}); leaving ${OUT} unchanged.`);
       return;
     }
   } catch { /* no previous file */ }
 
   const payload = {
+    schema: SCHEMA,
     updated: new Date().toISOString(),
     sourceUpdated: lastUpdated,
     source: "Redfin Data Center (redfin.com/news/data-center)",
