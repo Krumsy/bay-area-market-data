@@ -23,7 +23,11 @@ const BAY_AREA_METRO = /^(San Francisco|Oakland|San Jose|San Rafael|Santa Rosa|V
 const METRO_OVERRIDE = { "Mountain View": /^San Jose, CA/ }; // vs. the Contra Costa CDP
 
 // Bump when the fields written below change, so the file is rebuilt even if Redfin has nothing new.
-const SCHEMA = 2;
+const SCHEMA = 3;
+
+// Redfin's PROPERTY_TYPE values. "All Residential" goes in `cities`; the rest in `byType`.
+const ALL_TYPES = "All Residential";
+const TYPES = { "Single Family Residential": "sfh", "Townhouse": "townhouse", "Condo/Co-op": "condo" };
 
 const OUT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "market.json");
 
@@ -46,6 +50,8 @@ async function main() {
   let col = null;
   let lastUpdated = null;
   const out = Object.fromEntries(CITIES.map((c) => [c, []]));
+  const byType = Object.fromEntries(Object.values(TYPES).map((t) => [t, {}]));
+  const typesSeen = new Set();
   let scanned = 0;
   const skippedMetros = new Set();
 
@@ -65,13 +71,16 @@ async function main() {
     if (f[col.STATE_CODE] !== "CA") continue;
     const city = REGIONS.get(f[col.REGION]);
     if (!city) continue;
-    if (f[col.PROPERTY_TYPE] !== "All Residential" || f[col.IS_SEASONALLY_ADJUSTED] !== "false") continue;
+    const type = f[col.PROPERTY_TYPE];
+    typesSeen.add(type);
+    if ((type !== ALL_TYPES && !TYPES[type]) || f[col.IS_SEASONALLY_ADJUSTED] !== "false") continue;
     if (!(METRO_OVERRIDE[city] || BAY_AREA_METRO).test(f[col.PARENT_METRO_REGION])) {
       skippedMetros.add(`${city} -> ${f[col.PARENT_METRO_REGION]}`);
       continue;
     }
 
-    out[city].push({
+    const rows = type === ALL_TYPES ? out[city] : (byType[TYPES[type]][city] ||= []);
+    rows.push({
       date: f[col.PERIOD_END],
       price: num(f[col.MEDIAN_SALE_PRICE]),
       ppsf: num(f[col.MEDIAN_PPSF]) && Math.round(num(f[col.MEDIAN_PPSF])),
@@ -89,10 +98,19 @@ async function main() {
   const empty = CITIES.filter((c) => out[c].length === 0);
   if (empty.length) throw new Error(`No rows found for: ${empty.join(", ")}`);
 
-  for (const c of CITIES) {
-    out[c].sort((a, b) => a.date.localeCompare(b.date));
-    const dupe = out[c].find((r, i) => i && r.date === out[c][i - 1].date);
-    if (dupe) throw new Error(`Duplicate ${dupe.date} rows for ${c}; region match is ambiguous`);
+  const missingTypes = Object.keys(TYPES).filter((t) => !typesSeen.has(t));
+  if (missingTypes.length) throw new Error(`Redfin property types changed; missing: ${missingTypes.join(", ")}`);
+
+  // Every city must have "All Residential" data; a city with no townhouse or condo sales
+  // simply has no entry for that type.
+  const series = [
+    ...CITIES.map((c) => [c, out[c]]),
+    ...Object.entries(byType).flatMap(([t, m]) => Object.entries(m).map(([c, rows]) => [`${c} (${t})`, rows])),
+  ];
+  for (const [label, rows] of series) {
+    rows.sort((a, b) => a.date.localeCompare(b.date));
+    const dupe = rows.find((r, i) => i && r.date === rows[i - 1].date);
+    if (dupe) throw new Error(`Duplicate ${dupe.date} rows for ${label}; region match is ambiguous`);
   }
 
   // Redfin republishes monthly; skip the write when nothing is new so the workflow makes no commit.
@@ -110,11 +128,15 @@ async function main() {
     sourceUpdated: lastUpdated,
     source: "Redfin Data Center (redfin.com/news/data-center)",
     cities: out,
+    byType,
   };
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   fs.writeFileSync(OUT, JSON.stringify(payload));
   console.log(`Wrote ${OUT}`);
-  for (const c of CITIES) console.log(`  ${c}: ${out[c].length} months, latest ${out[c].at(-1).date}`);
+  for (const c of CITIES) {
+    const types = Object.entries(byType).map(([t, m]) => `${t} ${m[c]?.length ?? 0}`).join(", ");
+    console.log(`  ${c}: ${out[c].length} months, latest ${out[c].at(-1).date} (${types})`);
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
