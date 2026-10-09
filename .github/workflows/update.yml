@@ -29,17 +29,20 @@ jobs:
         with:
           node-version: 22
 
-      - name: Fetch Redfin data
+      - name: Fetch Redfin sales data
         run: node scripts/fetch_data.mjs
+
+      - name: Fetch Realtor.com listing data
+        run: node scripts/fetch_listings.mjs
 
       - name: Commit data if it changed
         run: |
-          if git diff --quiet -- data/market.json; then
+          if git diff --quiet -- data/; then
             echo "No new market data."
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/market.json
+            git add data/
             git commit -m "Update market data"
             git push
           fi
