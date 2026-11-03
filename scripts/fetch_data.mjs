@@ -1,14 +1,16 @@
-// Downloads Redfin's city market tracker, keeps Bay Area cities, writes data/market.json.
-// Zero dependencies: streams the ~1 GB gzip so memory stays small.
+// Downloads Redfin's Data Center city market data + price drops + metro affordability,
+// keeps Bay Area cities/metros, writes data/market.json.
+//
+// Redfin retired the old redfin_market_tracker/*.tsv000.gz files in late 2026 and moved
+// everything under redfin_data_center/, catalogued by index.json. We read those paths so
+// the pipeline survives future moves. Files are plain (large) CSVs streamed line by line.
 import https from "node:https";
-import zlib from "node:zlib";
 import readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SOURCE_URL =
-  "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/city_market_tracker.tsv000.gz";
+const BASE = "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_data_center/";
 
 const CITIES = [
   "San Francisco", "Oakland", "San Jose", "Palo Alto", "Mountain View",
@@ -17,107 +19,172 @@ const CITIES = [
   "Los Altos", "Menlo Park",
 ];
 const REGIONS = new Map(CITIES.map((c) => [`${c}, CA`, c]));
-// Some names repeat elsewhere in CA (e.g. a second "Mountain View"), so also require a Bay Area metro.
-const BAY_AREA_METRO = /^(San Francisco|Oakland|San Jose|San Rafael|Santa Rosa|Vallejo|Napa|Santa Cruz), CA/;
-// Cities whose name also matches a different place inside the Bay Area.
-const METRO_OVERRIDE = { "Mountain View": /^San Jose, CA/ }; // vs. the Contra Costa CDP
 
-// Bump when the fields written below change, so the file is rebuilt even if Redfin has nothing new.
-const SCHEMA = 3;
+// Which metro's affordability figures apply to each city (Redfin only publishes
+// affordability at the metro level). San Mateo County cities fall in the SF metro.
+const CITY_METRO = {
+  "San Jose": "San Jose", "Palo Alto": "San Jose", "Mountain View": "San Jose",
+  "Sunnyvale": "San Jose", "Cupertino": "San Jose", "Santa Clara": "San Jose",
+  "Los Altos": "San Jose",
+  "San Francisco": "San Francisco", "Oakland": "San Francisco", "Berkeley": "San Francisco",
+  "Fremont": "San Francisco", "Hayward": "San Francisco", "Walnut Creek": "San Francisco",
+  "Pleasanton": "San Francisco", "San Mateo": "San Francisco", "Redwood City": "San Francisco",
+  "Menlo Park": "San Francisco",
+};
+const AFF_METROS = new Map([
+  ["San Jose, CA metro area", "San Jose"],
+  ["San Francisco, CA metro area", "San Francisco"],
+]);
 
-// Redfin's PROPERTY_TYPE values. "All Residential" goes in `cities`; the rest in `byType`.
-const ALL_TYPES = "All Residential";
-const TYPES = { "Single Family Residential": "sfh", "Townhouse": "townhouse", "Condo/Co-op": "condo" };
+// Bump when the fields written below change, so the file is rebuilt even if Redfin's
+// publish date is unchanged.
+const SCHEMA = 4;
 
 const OUT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "market.json");
 
-const num = (v) => (v === "" || v === undefined || v === "NA" ? null : Number(v));
-const unquote = (s) => (s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s);
+const num = (v) => (v === "" || v == null || v === "NA" ? null : Number(v));
+const pct = (v) => { const n = num(v); return n == null ? null : Math.round(n / 100 * 1e4) / 1e4; };
 
-function fetchStream(url) {
+// Quote-aware CSV line parser (fields may contain commas, e.g. "Palo Alto, CA").
+function parseCsv(line) {
+  const out = [];
+  let cur = "", q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { if (q && line[i + 1] === '"') { cur += '"'; i++; } else q = !q; }
+    else if (c === "," && !q) { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+function get(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+    https.get(url, { headers: { "User-Agent": "bay-area-market-data/1.0 (+github actions)" } }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
       resolve(res);
     }).on("error", reject);
   });
 }
 
-async function main() {
-  const res = await fetchStream(SOURCE_URL);
-  const rl = readline.createInterface({ input: res.pipe(zlib.createGunzip()), crlfDelay: Infinity });
-
+// Stream a CSV, calling onRow(colIndexMap, fields) for each data row.
+async function streamCsv(url, required, onRow) {
+  const res = await get(url);
+  const rl = readline.createInterface({ input: res, crlfDelay: Infinity });
   let col = null;
-  let lastUpdated = null;
-  const out = Object.fromEntries(CITIES.map((c) => [c, []]));
-  const byType = Object.fromEntries(Object.values(TYPES).map((t) => [t, {}]));
-  const typesSeen = new Set();
-  let scanned = 0;
-  const skippedMetros = new Set();
-
   for await (const line of rl) {
-    const f = line.split("\t").map(unquote);
+    if (!line) continue;
+    const f = parseCsv(line);
     if (!col) {
-      col = Object.fromEntries(f.map((name, i) => [name, i]));
-      const required = ["REGION", "STATE_CODE", "PROPERTY_TYPE", "IS_SEASONALLY_ADJUSTED", "PERIOD_END",
-        "MEDIAN_SALE_PRICE", "MEDIAN_PPSF", "MEDIAN_DOM", "PRICE_DROPS", "HOMES_SOLD", "INVENTORY",
-        "AVG_SALE_TO_LIST", "SOLD_ABOVE_LIST",
-        "PARENT_METRO_REGION"];
+      col = Object.fromEntries(f.map((name, i) => [name.trim(), i]));
       const missing = required.filter((k) => !(k in col));
-      if (missing.length) throw new Error(`Redfin schema changed; missing columns: ${missing.join(", ")}`);
+      if (missing.length) throw new Error(`${url}\n  missing columns: ${missing.join(", ")}`);
       continue;
     }
-    if (++scanned % 1_000_000 === 0) console.log(`scanned ${scanned.toLocaleString()} rows`);
-    if (f[col.STATE_CODE] !== "CA") continue;
-    const city = REGIONS.get(f[col.REGION]);
-    if (!city) continue;
-    const type = f[col.PROPERTY_TYPE];
-    typesSeen.add(type);
-    if ((type !== ALL_TYPES && !TYPES[type]) || f[col.IS_SEASONALLY_ADJUSTED] !== "false") continue;
-    if (!(METRO_OVERRIDE[city] || BAY_AREA_METRO).test(f[col.PARENT_METRO_REGION])) {
-      skippedMetros.add(`${city} -> ${f[col.PARENT_METRO_REGION]}`);
-      continue;
-    }
+    onRow(col, f);
+  }
+}
 
-    const rows = type === ALL_TYPES ? out[city] : (byType[TYPES[type]][city] ||= []);
-    rows.push({
-      date: f[col.PERIOD_END],
-      price: num(f[col.MEDIAN_SALE_PRICE]),
-      ppsf: num(f[col.MEDIAN_PPSF]) && Math.round(num(f[col.MEDIAN_PPSF])),
-      dom: num(f[col.MEDIAN_DOM]),
-      priceDrops: num(f[col.PRICE_DROPS]),
-      saleToList: num(f[col.AVG_SALE_TO_LIST]),
-      soldAboveList: num(f[col.SOLD_ABOVE_LIST]),
-      sold: num(f[col.HOMES_SOLD]),
-      inventory: num(f[col.INVENTORY]),
+async function loadIndex() {
+  const res = await get(BASE + "index.json");
+  let s = "";
+  for await (const chunk of res) s += chunk;
+  const j = JSON.parse(s);
+  return {
+    cityUrl:  BASE + j.housing_market.monthly.city.all,
+    dropsUrl: BASE + j.price_drops.monthly.city.all,
+    affUrl:   BASE + j.affordability.metro.all,
+  };
+}
+
+async function main() {
+  const idx = await loadIndex();
+
+  // 1) City housing metrics (all residential). New file is rolling 3-month, published monthly.
+  const out = Object.fromEntries(CITIES.map((c) => [c, new Map()])); // city -> date -> row
+  let sourceUpdated = null;
+  await streamCsv(idx.cityUrl,
+    ["LAST UPDATED", "PERIOD END", "REGION TYPE", "REGION NAME", "HOMES SOLD",
+     "MEDIAN SALE PRICE NSA ($)", "MEDIAN SALE PRICE PER SQ.FT. ($)", "MEDIAN DAYS ON MARKET (DAYS)",
+     "AVERAGE SALE TO LIST RATIO (%)", "SHARE SOLD ABOVE ORIGINAL LIST (%)", "INVENTORY"],
+    (col, f) => {
+      if (f[col["REGION TYPE"]] !== "City") return;
+      const city = REGIONS.get(f[col["REGION NAME"]]);
+      if (!city) return;
+      sourceUpdated = f[col["LAST UPDATED"]] || sourceUpdated;
+      const date = f[col["PERIOD END"]];
+      const sold = num(f[col["HOMES SOLD"]]);
+      const row = {
+        date,
+        price: num(f[col["MEDIAN SALE PRICE NSA ($)"]]),
+        ppsf: num(f[col["MEDIAN SALE PRICE PER SQ.FT. ($)"]]),
+        dom: num(f[col["MEDIAN DAYS ON MARKET (DAYS)"]]),
+        priceDrops: null, // filled from the price_drops dataset below
+        saleToList: pct(f[col["AVERAGE SALE TO LIST RATIO (%)"]]),
+        soldAboveList: pct(f[col["SHARE SOLD ABOVE ORIGINAL LIST (%)"]]),
+        sold,
+        inventory: num(f[col["INVENTORY"]]),
+      };
+      const prev = out[city].get(date);
+      // Same-name places can collide; keep the row with the most sales (the real city).
+      if (!prev || (sold ?? -1) > (prev.sold ?? -1)) out[city].set(date, row);
     });
-    if ("LAST_UPDATED" in col) lastUpdated = f[col.LAST_UPDATED];
+
+  // 2) Price drops (restores the metric Redfin moved out of the city housing file).
+  await streamCsv(idx.dropsUrl,
+    ["PERIOD END", "REGION TYPE", "REGION NAME", "PERCENT ACTIVE WITH PRICE DROPS (%)"],
+    (col, f) => {
+      if (f[col["REGION TYPE"]] !== "City") return;
+      const city = REGIONS.get(f[col["REGION NAME"]]);
+      if (!city) return;
+      const row = out[city].get(f[col["PERIOD END"]]);
+      if (row) row.priceDrops = pct(f[col["PERCENT ACTIVE WITH PRICE DROPS (%)"]]);
+    });
+
+  // 3) Metro affordability (All Residential, all income groups, 20% down).
+  const aff = Object.fromEntries([...AFF_METROS.values()].map((m) => [m, new Map()]));
+  await streamCsv(idx.affUrl,
+    ["PERIOD END", "REGION NAME", "PROPERTY TYPE", "INCOME GROUP", "DOWN PAYMENT PERCENT (%)",
+     "INCOME REQUIRED ($)", "YEARS TO SAVE DOWN PAYMENT", "SHARE OF INCOME ON HOUSING (%)",
+     "MONTHLY HOUSING PAYMENT ($)", "DOWN PAYMENT AMOUNT ($)", "MEDIAN SALE PRICE ($)"],
+    (col, f) => {
+      const metro = AFF_METROS.get(f[col["REGION NAME"]]);
+      if (!metro) return;
+      if (f[col["PROPERTY TYPE"]] !== "All Residential") return;
+      if (f[col["INCOME GROUP"]] !== "All") return;
+      if (f[col["DOWN PAYMENT PERCENT (%)"]] !== "20") return;
+      const date = f[col["PERIOD END"]];
+      aff[metro].set(date, {
+        date,
+        incomeRequired: num(f[col["INCOME REQUIRED ($)"]]),
+        yearsToSave: num(f[col["YEARS TO SAVE DOWN PAYMENT"]]),
+        shareIncome: num(f[col["SHARE OF INCOME ON HOUSING (%)"]]),
+        monthly: num(f[col["MONTHLY HOUSING PAYMENT ($)"]]),
+        downPayment: num(f[col["DOWN PAYMENT AMOUNT ($)"]]),
+        medianPrice: num(f[col["MEDIAN SALE PRICE ($)"]]),
+      });
+    });
+
+  // Finalize: sort rows by date, validate coverage.
+  const cities = {};
+  for (const c of CITIES) {
+    cities[c] = [...out[c].values()].sort((a, b) => a.date.localeCompare(b.date));
+  }
+  const empty = CITIES.filter((c) => cities[c].length === 0);
+  if (empty.length) throw new Error(`No city rows for: ${empty.join(", ")}`);
+
+  const affordability = { downPaymentPct: 20, metros: {}, cityMetro: CITY_METRO };
+  for (const m of AFF_METROS.values()) {
+    affordability.metros[m] = [...aff[m].values()].sort((a, b) => a.date.localeCompare(b.date));
+    if (!affordability.metros[m].length) throw new Error(`No affordability rows for ${m} metro`);
   }
 
-  if (skippedMetros.size) console.log(`Skipped same-name places in other metros: ${[...skippedMetros].join("; ")}`);
-  const empty = CITIES.filter((c) => out[c].length === 0);
-  if (empty.length) throw new Error(`No rows found for: ${empty.join(", ")}`);
-
-  const missingTypes = Object.keys(TYPES).filter((t) => !typesSeen.has(t));
-  if (missingTypes.length) throw new Error(`Redfin property types changed; missing: ${missingTypes.join(", ")}`);
-
-  // Every city must have "All Residential" data; a city with no townhouse or condo sales
-  // simply has no entry for that type.
-  const series = [
-    ...CITIES.map((c) => [c, out[c]]),
-    ...Object.entries(byType).flatMap(([t, m]) => Object.entries(m).map(([c, rows]) => [`${c} (${t})`, rows])),
-  ];
-  for (const [label, rows] of series) {
-    rows.sort((a, b) => a.date.localeCompare(b.date));
-    const dupe = rows.find((r, i) => i && r.date === rows[i - 1].date);
-    if (dupe) throw new Error(`Duplicate ${dupe.date} rows for ${label}; region match is ambiguous`);
-  }
-
-  // Redfin republishes monthly; skip the write when nothing is new so the workflow makes no commit.
+  // Skip the write when nothing is new so the workflow makes no commit.
   try {
     const prev = JSON.parse(fs.readFileSync(OUT, "utf8"));
-    if (prev.schema === SCHEMA && prev.sourceUpdated && prev.sourceUpdated === lastUpdated) {
-      console.log(`No new Redfin data (still ${lastUpdated}); leaving ${OUT} unchanged.`);
+    if (prev.schema === SCHEMA && prev.sourceUpdated && prev.sourceUpdated === sourceUpdated) {
+      console.log(`No new Redfin data (still ${sourceUpdated}); leaving ${OUT} unchanged.`);
       return;
     }
   } catch { /* no previous file */ }
@@ -125,17 +192,22 @@ async function main() {
   const payload = {
     schema: SCHEMA,
     updated: new Date().toISOString(),
-    sourceUpdated: lastUpdated,
+    sourceUpdated,
     source: "Redfin Data Center (redfin.com/news/data-center)",
-    cities: out,
-    byType,
+    cities,
+    byType: {}, // Redfin's new city file has no property-type breakdown.
+    affordability,
   };
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   fs.writeFileSync(OUT, JSON.stringify(payload));
-  console.log(`Wrote ${OUT}`);
+  console.log(`Wrote ${OUT} (sourceUpdated ${sourceUpdated})`);
   for (const c of CITIES) {
-    const types = Object.entries(byType).map(([t, m]) => `${t} ${m[c]?.length ?? 0}`).join(", ");
-    console.log(`  ${c}: ${out[c].length} months, latest ${out[c].at(-1).date} (${types})`);
+    const last = cities[c].at(-1);
+    console.log(`  ${c}: ${cities[c].length} periods, latest ${last.date} $${last.price} dom ${last.dom} drops ${last.priceDrops}`);
+  }
+  for (const m of AFF_METROS.values()) {
+    const a = affordability.metros[m].at(-1);
+    console.log(`  [${m} affordability] ${a.date}: income req $${a.incomeRequired}, ${a.yearsToSave} yrs to save, ${a.shareIncome}% of income`);
   }
 }
 
